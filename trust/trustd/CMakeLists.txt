@@ -41,6 +41,25 @@ add_lib_ios_shim(libtrustd
 		LIBTRUSTD=1
 )
 
+# This code is written for ARC (default-strong properties, CFBridgingRelease); built without it, the
+# URL session delegate's dictionaries were never retained and trustd used them after they were freed.
+# ponytail: OTATrustUtilities.m and SecRevocationNetworking.m stay without ARC because ARC makes their
+# calls to undeclared methods (MobileAsset stubs, two NSURLSession ones, +URLPathAllowedCharacterSet)
+# errors. Declare those in the framework headers, then switch this to OBJC_ARC on the whole library.
+set_source_files_properties(
+	CertificateTransparency.m
+	md.m
+	SecCAIssuerRequest.m
+	SecPinningDb.m
+	SecTrustExceptionResetCount.m
+	SecTrustLoggingServer.m
+	SecTrustStoreServer.m
+	trustdFileLocations.m
+	TrustURLSessionCache.m
+	TrustURLSessionDelegate.m
+	PROPERTIES COMPILE_OPTIONS -fobjc-arc
+)
+
 add_darling_executable(trustd
 	../../OSX/sec/ipc/server_entitlement_helpers.c
 	trustd.c
