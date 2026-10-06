@@ -886,7 +886,9 @@ static void darlingLoadHostRoots(void *context)
 				break;
 			}
 			stop += sizeof(end) - 1;
-			CFDataRef block = CFDataCreate(NULL, (const UInt8 *)pem.data() + at, stop - at);
+			/* SecCertificateCreateWithPEM wants the end line with its newline, which the last block of a file may lack */
+			std::string one = pem.substr(at, stop - at) + "\n";
+			CFDataRef block = CFDataCreate(NULL, (const UInt8 *)one.data(), one.size());
 			SecCertificateRef cert = SecCertificateCreateWithPEM(NULL, block);
 			if(cert != NULL) {
 				CFArrayAppendValue(*roots, cert);
