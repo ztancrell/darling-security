@@ -53,9 +53,18 @@
 #include <libproc.h>
 #include <syslog.h>
 #include <vector>
+#include <string>
+#include <unistd.h>
+#include <dispatch/dispatch.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CFPreferences.h>
 #include <utilities/SecCFRelease.h>
+
+#ifdef DARLING
+/* the system domain answered from the host's CA bundle; defined before the API functions below */
+static bool darlingUsesHostRoots();
+static CFArrayRef darlingHostRoots();
+#endif
 
 #define trustSettingsDbg(args...)	secinfo("trustSettings", ## args)
 
@@ -689,6 +698,21 @@ OSStatus SecTrustSettingsCopyUnrestrictedRoots(
 {
 	BEGIN_RCSAPI
 
+#ifdef DARLING
+	if (system && darlingUsesHostRoots()) {
+		/* the system domain is the host's roots; user and admin roots, when there are any, come first */
+		CFArrayRef others = NULL;
+		CFMutableArrayRef all = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+		if ((user || admin) && tsCopyCertsCommon(NULL, NULL, NULL, true, user, admin, false, &others) == errSecSuccess && others != NULL) {
+			CFArrayAppendArray(all, others, CFRangeMake(0, CFArrayGetCount(others)));
+			CFRelease(others);
+		}
+		CFArrayRef roots = darlingHostRoots();
+		CFArrayAppendArray(all, roots, CFRangeMake(0, CFArrayGetCount(roots)));
+		*certArray = all;
+		return errSecSuccess;
+	}
+#endif
 	OSStatus status = tsCopyCertsCommon(NULL, NULL, NULL,	/* no constraints */
 		true,				/* onlyRoots */
 		user, admin, system,
@@ -810,6 +834,92 @@ OSStatus SecTrustSettingsCopyTrustSettings_Cached(
     return result;
 }
 
+#pragma mark --- Darling: system roots from the host ---
+
+#ifdef DARLING
+/*
+ * On macOS the system domain is SystemRootCertificates.keychain plus SystemTrustSettings.plist. Darling
+ * has no such trust settings file; a guest's system trust anchors are the certificate authorities the
+ * host system trusts. While the plist is absent, the system domain answers from the host's CA bundle:
+ * every certificate in it is a root trusted without constraints (an empty trust settings array).
+ *
+ * ponytail: the bundle is read once per process, and its roots are not run through SecTrustEvaluate the
+ * way SecTrustSettingsCopyCertificates filters keychain roots. trustd still uses its own root list.
+ */
+static bool darlingUsesHostRoots()
+{
+	return access(SYSTEM_TRUST_SETTINGS_PATH, F_OK) != 0;
+}
+
+static void darlingLoadHostRoots(void *context)
+{
+	CFMutableArrayRef *roots = (CFMutableArrayRef *)context;
+	/* the same places the launcher looks, seen from inside the container */
+	static const char * const paths[] = {
+		"/Volumes/SystemRoot/etc/ssl/certs/ca-certificates.crt",
+		"/Volumes/SystemRoot/etc/pki/tls/certs/ca-bundle.crt",
+		"/Volumes/SystemRoot/etc/ssl/ca-bundle.pem",
+		"/Volumes/SystemRoot/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+		"/Volumes/SystemRoot/etc/ssl/cert.pem",
+	};
+	static const char begin[] = "-----BEGIN CERTIFICATE-----";
+	static const char end[] = "-----END CERTIFICATE-----";
+
+	*roots = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	for(size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		FILE *file = fopen(paths[i], "r");
+		if(file == NULL) {
+			continue;
+		}
+		std::string pem;
+		char buffer[65536];
+		size_t got;
+		while((got = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+			pem.append(buffer, got);
+		}
+		fclose(file);
+
+		size_t at = 0;
+		while((at = pem.find(begin, at)) != std::string::npos) {
+			size_t stop = pem.find(end, at);
+			if(stop == std::string::npos) {
+				break;
+			}
+			stop += sizeof(end) - 1;
+			CFDataRef block = CFDataCreate(NULL, (const UInt8 *)pem.data() + at, stop - at);
+			SecCertificateRef cert = SecCertificateCreateWithPEM(NULL, block);
+			if(cert != NULL) {
+				CFArrayAppendValue(*roots, cert);
+				CFRelease(cert);
+			}
+			CFRelease(block);
+			at = stop;
+		}
+		if(CFArrayGetCount(*roots) > 0) {
+			break;
+		}
+	}
+	if(CFArrayGetCount(*roots) == 0) {
+		syslog(LOG_ERR, "Security: no host CA bundle found; the system trust settings domain is empty");
+	}
+}
+
+/* not retained for the caller */
+static CFArrayRef darlingHostRoots()
+{
+	static dispatch_once_t once;
+	static CFMutableArrayRef roots;
+	dispatch_once_f(&once, &roots, darlingLoadHostRoots);
+	return roots;
+}
+
+static bool darlingIsHostRoot(SecCertificateRef cert)
+{
+	CFArrayRef roots = darlingHostRoots();
+	return CFArrayContainsValue(roots, CFRangeMake(0, CFArrayGetCount(roots)), cert);
+}
+#endif /* DARLING */
+
 #pragma mark --- API functions ---
 
 OSStatus SecTrustSettingsCopyTrustSettings(
@@ -820,6 +930,16 @@ OSStatus SecTrustSettingsCopyTrustSettings(
 	TS_REQUIRED(certRef)
 	TS_REQUIRED(trustSettings)
 
+#ifdef DARLING
+	if (domain == kSecTrustSettingsDomainSystem && darlingUsesHostRoots()) {
+		if (!darlingIsHostRoot(certRef)) {
+			return errSecItemNotFound;
+		}
+		/* no constraints: trusted as a root for everything */
+		*trustSettings = CFArrayCreate(NULL, NULL, 0, &kCFTypeArrayCallBacks);
+		return errSecSuccess;
+	}
+#endif
 	OSStatus result = tsCopyTrustSettings(certRef, domain, trustSettings, NULL);
 	if (result == errSecSuccess && *trustSettings == NULL) {
 		result = errSecItemNotFound; /* documented result if no trust settings exist */
@@ -915,6 +1035,17 @@ OSStatus SecTrustSettingsCopyCertificates(
 	BEGIN_RCSAPI
 
 	TS_REQUIRED(certArray)
+
+#ifdef DARLING
+	if (domain == kSecTrustSettingsDomainSystem && darlingUsesHostRoots()) {
+		CFArrayRef roots = darlingHostRoots();
+		if (CFArrayGetCount(roots) == 0) {
+			return errSecNoTrustSettings;
+		}
+		*certArray = CFArrayCreateCopy(NULL, roots);
+		return errSecSuccess;
+	}
+#endif
 
 	OSStatus status;
 	TrustSettings* ts;
